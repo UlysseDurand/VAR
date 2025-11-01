@@ -18,3 +18,11 @@ local_output*
 *.log
 *.txt
 *.ipynb
+*.md
+**/output
+**/output/*
+*.sh
+**/data/
+**/data/*
+
+

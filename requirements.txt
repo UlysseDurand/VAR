@@ -6,3 +6,10 @@ numpy
 pytz
 transformers
 typed-argument-parser
+tqdm
+matplotlib
+tensorboard
+
+# Optional for advanced evaluation
+# lpips  # Perceptual similarity metric
+# pytorch-fid  # FID score computation
