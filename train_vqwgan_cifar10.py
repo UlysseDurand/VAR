@@ -22,9 +22,9 @@ def get_args_parser():
     parser = argparse.ArgumentParser('VQWGAN CIFAR-10 training', add_help=False)
     
     # Model parameters (adapted for 32x32 images)
-    parser.add_argument('--vocab_size', default=512, type=int, help='Smaller vocab for CIFAR-10')
-    parser.add_argument('--z_channels', default=16, type=int, help='Reduced latent channels')
-    parser.add_argument('--ch', default=64, type=int, help='Smaller base channels')
+    parser.add_argument('--vocab_size', default=1024, type=int, help='Vocab size for CIFAR-10')
+    parser.add_argument('--z_channels', default=32, type=int, help='Latent channels')
+    parser.add_argument('--ch', default=128, type=int, help='Base channels')
     parser.add_argument('--beta', default=0.25, type=float, help='commitment loss weight')
     parser.add_argument('--using_znorm', action='store_true')
     parser.add_argument('--quant_resi', default=0.5, type=float)
@@ -33,18 +33,20 @@ def get_args_parser():
     # WGAN parameters
     parser.add_argument('--disc_ch', default=64, type=int)
     parser.add_argument('--disc_num_layers', default=2, type=int, help='Fewer layers for small images')
-    parser.add_argument('--disc_start', default=5000, type=int, help='Start disc earlier')
-    parser.add_argument('--disc_weight', default=0.5, type=float)
+    parser.add_argument('--disc_start', default=10000, type=int, help='Start disc later')
+    parser.add_argument('--disc_weight', default=0.1, type=float, help='Lower adversarial weight initially')
     parser.add_argument('--gp_weight', default=10.0, type=float)
-    parser.add_argument('--n_critic', default=5, type=int)
+    parser.add_argument('--n_critic', default=1, type=int, help='Update disc less frequently')
     parser.add_argument('--use_patch_disc', action='store_true')
+    parser.add_argument('--perceptual_weight', default=1.0, type=float, help='Perceptual loss weight')
     
     # Training parameters
-    parser.add_argument('--batch_size', default=128, type=int, help='Larger batch for CIFAR')
+    parser.add_argument('--batch_size', default=64, type=int, help='Batch size for CIFAR')
     parser.add_argument('--epochs', default=200, type=int)
-    parser.add_argument('--lr', default=1e-4, type=float, help='Higher LR for small images')
-    parser.add_argument('--disc_lr', default=2e-4, type=float)
-    parser.add_argument('--weight_decay', default=0.0, type=float)
+    parser.add_argument('--lr', default=4e-5, type=float, help='Learning rate')
+    parser.add_argument('--disc_lr', default=1e-4, type=float)
+    parser.add_argument('--weight_decay', default=0.05, type=float)
+    parser.add_argument('--warmup_steps', default=500, type=int, help='Warmup steps')
     
     # Dataset parameters
     parser.add_argument('--data_path', default='./data', type=str)
@@ -78,6 +80,23 @@ class VQWGANTrainer:
         self.device = device
         self.args = args
         self.global_step = 0
+        
+        # Learning rate warmup
+        self.base_lr = args.lr
+        self.warmup_steps = args.warmup_steps
+    
+    def get_lr(self):
+        """Learning rate with warmup"""
+        if self.global_step < self.warmup_steps:
+            return self.base_lr * (self.global_step / self.warmup_steps)
+        return self.base_lr
+    
+    def update_lr(self):
+        """Update learning rate for warmup"""
+        if self.global_step < self.warmup_steps:
+            lr = self.get_lr()
+            for param_group in self.optimizer_g.param_groups:
+                param_group['lr'] = lr
     
     def train_step(
         self,
@@ -87,9 +106,13 @@ class VQWGANTrainer:
         """Single training step"""
         real_imgs = real_imgs.to(self.device)
         
+        # Update learning rate (warmup)
+        self.update_lr()
+        
         # ========== Update Discriminator ==========
         if self.global_step >= self.args.disc_start:
-            for _ in range(self.args.n_critic):
+            # Only update discriminator every n_critic generator steps
+            if self.global_step % self.args.n_critic == 0:
                 self.optimizer_d.zero_grad()
                 
                 # Generate fake images
@@ -101,6 +124,9 @@ class VQWGANTrainer:
                 
                 d_loss.backward()
                 self.optimizer_d.step()
+            else:
+                d_loss = torch.tensor(0.0)
+                d_stats = {}
         else:
             d_loss = torch.tensor(0.0)
             d_stats = {}
@@ -113,8 +139,10 @@ class VQWGANTrainer:
         
         g_total_loss.backward()
         
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        # Gradient clipping (less aggressive)
+        torch.nn.utils.clip_grad_norm_(self.model.encoder.parameters(), max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), max_norm=5.0)
+        torch.nn.utils.clip_grad_norm_(self.model.quantize.parameters(), max_norm=5.0)
         
         self.optimizer_g.step()
         
@@ -183,8 +211,8 @@ def main(args):
     torch.manual_seed(args.seed)
     
     # CIFAR-10 specific: smaller patch numbers for 32x32 images
-    # For 32x32: downsample 16x → 2x2 final size
-    v_patch_nums = (1, 2)  # Only 2 scales for 32x32
+    # For 32x32 with 4x downsampling → 8x8 final size
+    v_patch_nums = (1, 2, 4, 8)  # Multi-scale for 32x32
     
     # Build model
     print(f'Building VQWGAN model for CIFAR-10 (32x32)...')
@@ -203,6 +231,7 @@ def main(args):
         disc_weight=args.disc_weight,
         gp_weight=args.gp_weight,
         use_patch_disc=args.use_patch_disc,
+        perceptual_weight=args.perceptual_weight,
         test_mode=False,
     )
     model = model.to(device)

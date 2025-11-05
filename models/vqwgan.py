@@ -131,16 +131,18 @@ class VQWGAN(nn.Module):
         disc_weight=0.5,        # weight for adversarial loss
         use_patch_disc=True,    # use patch discriminator
         gp_weight=10.0,         # gradient penalty weight
+        perceptual_weight=1.0,  # perceptual loss weight
         test_mode=True,
     ):
         super().__init__()
         self.test_mode = test_mode
         self.V, self.Cvae = vocab_size, z_channels
         
-        # VAE components (same as VQVAE)
+        # VAE components - CORRECTED for 32x32 images
+        # For CIFAR-10: use ch_mult=(1, 2, 4) for 4x downsampling (32→8)
         ddconfig = dict(
             dropout=dropout, ch=ch, z_channels=z_channels,
-            in_channels=3, ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,
+            in_channels=3, ch_mult=(1, 2, 4), num_res_blocks=2,
             using_sa=True, using_mid_sa=True,
         )
         ddconfig.pop('double_z', None)
@@ -159,6 +161,9 @@ class VQWGAN(nn.Module):
         
         self.quant_conv = nn.Conv2d(self.Cvae, self.Cvae, quant_conv_ks, stride=1, padding=quant_conv_ks // 2)
         self.post_quant_conv = nn.Conv2d(self.Cvae, self.Cvae, quant_conv_ks, stride=1, padding=quant_conv_ks // 2)
+        
+        # Initialize the quantizer codebook
+        self.quantize.eini(0.02)  # Small initialization for better stability
         
         # Wasserstein discriminator components
         self.discriminator = WassersteinDiscriminator(
@@ -181,6 +186,7 @@ class VQWGAN(nn.Module):
         self.disc_start = disc_start
         self.disc_weight = disc_weight
         self.gp_weight = gp_weight
+        self.perceptual_weight = perceptual_weight
         self.discriminator_iter_start = 0
         
         if self.test_mode:
@@ -287,13 +293,15 @@ class VQWGAN(nn.Module):
         # Forward pass
         rec, usages, vq_loss = self.forward(inp, ret_usages=True)
         
-        # Reconstruction loss (L1 or L2)
-        rec_loss = F.l1_loss(rec, inp)
+        # Reconstruction loss (L1 + L2 for stability)
+        rec_loss = F.l1_loss(rec, inp) + 0.5 * F.mse_loss(rec, inp)
         
         # Adversarial loss (only after disc_start iterations)
         if global_step >= self.disc_start:
             g_loss = self.generator_loss(rec)
-            total_loss = rec_loss + vq_loss + self.disc_weight * g_loss
+            # Gradually ramp up adversarial loss
+            adv_weight = min(1.0, (global_step - self.disc_start) / 5000.0) * self.disc_weight
+            total_loss = rec_loss + vq_loss + adv_weight * g_loss
         else:
             g_loss = torch.tensor(0.0, device=inp.device)
             total_loss = rec_loss + vq_loss
