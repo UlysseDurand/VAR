@@ -34,9 +34,9 @@ def get_args_parser():
     parser.add_argument('--disc_ch', default=64, type=int)
     parser.add_argument('--disc_num_layers', default=2, type=int, help='Fewer layers for small images')
     parser.add_argument('--disc_start', default=10000, type=int, help='Start disc later')
-    parser.add_argument('--disc_weight', default=0.1, type=float, help='Lower adversarial weight initially')
-    parser.add_argument('--gp_weight', default=10.0, type=float)
-    parser.add_argument('--n_critic', default=1, type=int, help='Update disc less frequently')
+    parser.add_argument('--disc_weight', default=0.5, type=float, help='Lower adversarial weight initially')
+    parser.add_argument('--gp_weight', default=20.0, type=float)
+    parser.add_argument('--n_critic', default=5, type=int, help='Update disc less frequently')
     parser.add_argument('--use_patch_disc', action='store_true')
     parser.add_argument('--perceptual_weight', default=1.0, type=float, help='Perceptual loss weight')
     
@@ -44,7 +44,7 @@ def get_args_parser():
     parser.add_argument('--batch_size', default=64, type=int, help='Batch size for CIFAR')
     parser.add_argument('--epochs', default=200, type=int)
     parser.add_argument('--lr', default=4e-5, type=float, help='Learning rate')
-    parser.add_argument('--disc_lr', default=1e-4, type=float)
+    parser.add_argument('--disc_lr', default=3e-4, type=float)
     parser.add_argument('--weight_decay', default=0.05, type=float)
     parser.add_argument('--warmup_steps', default=500, type=int, help='Warmup steps')
     
@@ -84,6 +84,10 @@ class VQWGANTrainer:
         # Learning rate warmup
         self.base_lr = args.lr
         self.warmup_steps = args.warmup_steps
+        
+        # Keep track of last discriminator loss for logging
+        self.last_d_loss = 0.0
+        self.last_d_stats = {}
     
     def get_lr(self):
         """Learning rate with warmup"""
@@ -124,11 +128,16 @@ class VQWGANTrainer:
                 
                 d_loss.backward()
                 self.optimizer_d.step()
+                
+                # Store for logging
+                self.last_d_loss = d_loss.item()
+                self.last_d_stats = d_stats
             else:
-                d_loss = torch.tensor(0.0)
-                d_stats = {}
+                # Use last recorded values (not training this step)
+                d_loss = self.last_d_loss
+                d_stats = self.last_d_stats
         else:
-            d_loss = torch.tensor(0.0)
+            d_loss = 0.0
             d_stats = {}
         
         # ========== Update Generator ==========
@@ -165,7 +174,7 @@ class VQWGANTrainer:
         
         self.global_step += 1
         
-        return g_total_loss.item(), d_loss.item() if isinstance(d_loss, torch.Tensor) else d_loss
+        return g_total_loss.item(), d_loss if isinstance(d_loss, float) else d_loss.item()
     
     @torch.no_grad()
     def visualize(self, val_loader: DataLoader, save_path: str):
@@ -334,8 +343,10 @@ def main(args):
             
             # Logging
             if trainer.global_step % args.log_freq == 0:
+                # Indicate if discriminator was actually updated this step
+                disc_marker = "🔄" if trainer.global_step % args.n_critic == 0 else "  "
                 print(f'Epoch [{epoch}/{args.epochs}] '
-                      f'Step [{trainer.global_step}] '
+                      f'Step [{trainer.global_step}] {disc_marker} '
                       f'G_loss: {g_loss:.4f} D_loss: {d_loss:.4f}')
             
             # Save checkpoint
