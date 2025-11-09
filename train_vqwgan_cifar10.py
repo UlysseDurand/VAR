@@ -33,10 +33,10 @@ def get_args_parser():
     # WGAN parameters
     parser.add_argument('--disc_ch', default=64, type=int)
     parser.add_argument('--disc_num_layers', default=2, type=int, help='Fewer layers for small images')
-    parser.add_argument('--disc_start', default=10000, type=int, help='Start disc later')
+    parser.add_argument('--disc_start', default=0, type=int, help='Start gen later')
     parser.add_argument('--disc_weight', default=0.5, type=float, help='Lower adversarial weight initially')
     parser.add_argument('--gp_weight', default=20.0, type=float)
-    parser.add_argument('--n_critic', default=5, type=int, help='Update disc less frequently')
+    parser.add_argument('--n_critic', default=5, type=int, help='Update gen less frequently')
     parser.add_argument('--use_patch_disc', action='store_true')
     parser.add_argument('--perceptual_weight', default=1.0, type=float, help='Perceptual loss weight')
     
@@ -55,7 +55,7 @@ def get_args_parser():
     # Distributed training
     parser.add_argument('--local_rank', type=int, default=-1)
     parser.add_argument('--seed', default=0, type=int)
-    parser.add_argument('--gpu', default=1, type=int, help='GPU id to use (0 or 1)')
+    parser.add_argument('--gpu', default=0, type=int, help='GPU id to use (0 or 1)')
     
     # Logging
     parser.add_argument('--output_dir', default='./output/vqwgan_cifar10', type=str)
@@ -85,9 +85,11 @@ class VQWGANTrainer:
         self.base_lr = args.lr
         self.warmup_steps = args.warmup_steps
         
-        # Keep track of last discriminator loss for logging
+        # Keep track of last losses for logging
         self.last_d_loss = 0.0
         self.last_d_stats = {}
+        self.last_g_loss = 0.0
+        self.last_g_stats = {}
     
     def get_lr(self):
         """Learning rate with warmup"""
@@ -113,55 +115,67 @@ class VQWGANTrainer:
         # Update learning rate (warmup)
         self.update_lr()
         
-        # ========== Update Discriminator ==========
+        # ========== Update Discriminator (Critic) ==========
+        # Le discriminateur s'entraîne à chaque pas (sauf si le générateur n'a pas encore démarré)
         if self.global_step >= self.args.disc_start:
-            # Only update discriminator every n_critic generator steps
-            if self.global_step % self.args.n_critic == 0:
-                self.optimizer_d.zero_grad()
-                
-                # Generate fake images
-                with torch.no_grad():
-                    fake_imgs, _, _ = self.model(real_imgs)
-                
-                # Compute discriminator loss
-                d_loss, d_stats = self.model.discriminator_loss(real_imgs, fake_imgs)
-                
-                d_loss.backward()
-                self.optimizer_d.step()
-                
-                # Store for logging
-                self.last_d_loss = d_loss.item()
-                self.last_d_stats = d_stats
-            else:
-                # Use last recorded values (not training this step)
-                d_loss = self.last_d_loss
-                d_stats = self.last_d_stats
+            self.optimizer_d.zero_grad()
+            
+            # Generate fake images
+            with torch.no_grad():
+                fake_imgs, _, _ = self.model(real_imgs)
+            
+            # Compute discriminator loss
+            d_loss, d_stats = self.model.discriminator_loss(real_imgs, fake_imgs)
+            
+            d_loss.backward()
+            self.optimizer_d.step()
+            
+            # Store for logging
+            self.last_d_loss = d_loss.item()
+            self.last_d_stats = d_stats
         else:
+            # Avant disc_start, pas d'entraînement du discriminateur
             d_loss = 0.0
             d_stats = {}
         
         # ========== Update Generator ==========
-        self.optimizer_g.zero_grad()
-        
-        # Compute generator loss
-        g_total_loss, g_stats = self.model.compute_loss(real_imgs, self.global_step)
-        
-        g_total_loss.backward()
-        
-        # Gradient clipping (less aggressive)
-        torch.nn.utils.clip_grad_norm_(self.model.encoder.parameters(), max_norm=5.0)
-        torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), max_norm=5.0)
-        torch.nn.utils.clip_grad_norm_(self.model.quantize.parameters(), max_norm=5.0)
-        
-        self.optimizer_g.step()
+        # Le générateur s'entraîne uniquement tous les n_critic pas
+        if self.global_step >= self.args.disc_start and self.global_step % self.args.n_critic == 0:
+            self.optimizer_g.zero_grad()
+            
+            # Compute generator loss
+            g_total_loss, g_stats = self.model.compute_loss(real_imgs, self.global_step)
+
+            g_total_loss.backward()
+
+            # Gradient clipping (less aggressive)
+            torch.nn.utils.clip_grad_norm_(self.model.encoder.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), max_norm=5.0)
+            torch.nn.utils.clip_grad_norm_(self.model.quantize.parameters(), max_norm=5.0)
+            
+            self.optimizer_g.step()
+            
+            # Store for logging
+            self.last_g_loss = g_total_loss.item()
+            self.last_g_stats = g_stats
+        else:
+            # Utiliser les dernières valeurs enregistrées pour le logging
+            if hasattr(self, 'last_g_loss'):
+                g_total_loss = torch.tensor(self.last_g_loss)
+                g_stats = self.last_g_stats
+            else:
+                g_total_loss = torch.tensor(0.0)
+                g_stats = {'total_loss': 0.0, 'rec_loss': 0.0, 'vq_loss': 0.0, 'g_loss': 0.0}
+
+
         
         # Update metrics
         if self.global_step % self.args.log_freq == 0:
             metric_lg.update(
-                g_loss=g_stats['total_loss'],
-                rec_loss=g_stats['rec_loss'],
-                vq_loss=g_stats['vq_loss'],
-                adv_loss=g_stats['g_loss'],
+                g_loss=g_stats.get('total_loss', 0.0),
+                rec_loss=g_stats.get('rec_loss', 0.0),
+                vq_loss=g_stats.get('vq_loss', 0.0),
+                adv_loss=g_stats.get('g_loss', 0.0),
             )
             
             if d_stats:
@@ -343,10 +357,10 @@ def main(args):
             
             # Logging
             if trainer.global_step % args.log_freq == 0:
-                # Indicate if discriminator was actually updated this step
-                disc_marker = "🔄" if trainer.global_step % args.n_critic == 0 else "  "
+                # Indicate if generator was actually updated this step
+                gen_marker = "🔄 G" if trainer.global_step % args.n_critic == 0 else "   D"
                 print(f'Epoch [{epoch}/{args.epochs}] '
-                      f'Step [{trainer.global_step}] {disc_marker} '
+                      f'Step [{trainer.global_step}] {gen_marker} '
                       f'G_loss: {g_loss:.4f} D_loss: {d_loss:.4f}')
             
             # Save checkpoint
