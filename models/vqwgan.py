@@ -1,11 +1,5 @@
 """
-VQWGAN: Vector Quantized Wasserstein GAN
-Combines VQGAN tokenizer with Wasserstein GAN discriminator for improved training stability
-
-References:
-- VQGAN: https://github.com/CompVis/taming-transformers
-- WGAN-GP: https://arxiv.org/abs/1704.00028
-- Improved WGAN: https://arxiv.org/abs/1704.00028
+VQWGAN: Vector Quantized Wasserstein GAN that we added 
 """
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -27,7 +21,7 @@ class WassersteinDiscriminator(nn.Module):
         in_channels=3,
         ch=64,
         num_layers=3,
-        use_spectral_norm=True,
+        use_spectral_norm=False,
     ):
         super().__init__()
         
@@ -36,7 +30,6 @@ class WassersteinDiscriminator(nn.Module):
         layers = []
         current_ch = in_channels
         
-        # Progressive downsampling with increasing channels
         for i in range(num_layers):
             out_ch = ch * (2 ** i)
             layers.extend([
@@ -45,7 +38,7 @@ class WassersteinDiscriminator(nn.Module):
             ])
             current_ch = out_ch
         
-        # Additional conv layers without downsampling
+        #conv layers without downsampling
         layers.extend([
             norm_layer(nn.Conv2d(current_ch, current_ch, kernel_size=3, stride=1, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
@@ -109,7 +102,6 @@ class PatchDiscriminator(nn.Module):
 class VQWGAN(nn.Module):
     """
     Vector Quantized Wasserstein GAN
-    Combines VQ-VAE with Wasserstein discriminator for better perceptual quality
     """
     def __init__(
         self,
@@ -125,7 +117,7 @@ class VQWGAN(nn.Module):
         default_qresi_counts=0,
         v_patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
         # Wasserstein GAN specific parameters
-        disc_ch=64,             # discriminator base channels
+        disc_ch=64,             # discriminator channels
         disc_num_layers=3,      # number of discriminator layers
         disc_start=10000,       # iteration to start discriminator training
         disc_weight=0.5,        # weight for adversarial loss
@@ -138,8 +130,6 @@ class VQWGAN(nn.Module):
         self.test_mode = test_mode
         self.V, self.Cvae = vocab_size, z_channels
         
-        # VAE components - CORRECTED for 32x32 images
-        # For CIFAR-10: use ch_mult=(1, 2, 4) for 4x downsampling (32→8)
         ddconfig = dict(
             dropout=dropout, ch=ch, z_channels=z_channels,
             in_channels=3, ch_mult=(1, 2, 4), num_res_blocks=2,
@@ -170,7 +160,7 @@ class VQWGAN(nn.Module):
             in_channels=3,
             ch=disc_ch,
             num_layers=disc_num_layers,
-            use_spectral_norm=True,
+            use_spectral_norm=False,
         )
         
         if use_patch_disc:
@@ -207,7 +197,17 @@ class VQWGAN(nn.Module):
         Returns: reconstruction, usages, vq_loss
         """
         f = self.encode(inp)
+        
+        # CRITICAL: Clamp latents to prevent explosion
+        # This prevents the encoder from producing extreme values under adversarial pressure
+        f = torch.clamp(f, -10.0, 10.0)
+        
         f_hat, usages, vq_loss = self.quantize(f, ret_usages=ret_usages)
+        
+        # Additional safety: clamp vq_loss to prevent gradient explosion
+        if isinstance(vq_loss, torch.Tensor):
+            vq_loss = torch.clamp(vq_loss, 0.0, 100.0)
+        
         rec = self.decode(f_hat)
         return rec, usages, vq_loss
     
@@ -314,7 +314,7 @@ class VQWGAN(nn.Module):
             'usages': usages,
         }
     
-    # ===================== Interface methods (same as VQVAE) =====================
+    # methods copied from VQVAE in this repo
     
     def fhat_to_img(self, f_hat: torch.Tensor):
         return self.decode(f_hat)
