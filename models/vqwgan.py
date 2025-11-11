@@ -13,8 +13,7 @@ from .quant import VectorQuantizer2
 
 class WassersteinDiscriminator(nn.Module):
     """
-    Wasserstein discriminator (critic) with spectral normalization
-    Outputs a real-valued score instead of a probability
+    Wasserstein discriminator with spectral normalization (we tested both but it worked better without)
     """
     def __init__(
         self,
@@ -50,12 +49,6 @@ class WassersteinDiscriminator(nn.Module):
         self.main = nn.Sequential(*layers)
     
     def forward(self, x):
-        """
-        Args:
-            x: Input tensor [B, C, H, W]
-        Returns:
-            Critic score [B, 1, H', W'] where H', W' are reduced dimensions
-        """
         return self.main(x)
 
 
@@ -117,13 +110,14 @@ class VQWGAN(nn.Module):
         default_qresi_counts=0,
         v_patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),
         # Wasserstein GAN specific parameters
+
         disc_ch=64,             # discriminator channels
         disc_num_layers=3,      # number of discriminator layers
         disc_start=10000,       # iteration to start discriminator training
-        disc_weight=0.5,        # weight for adversarial loss
-        use_patch_disc=True,    # use patch discriminator
+        disc_weight=0.5,        # adv loss weight 
+        use_patch_disc=False,    # use patch discriminator we saw in some papers that the usage of patch disc could help and we tried but it was not very effective
         gp_weight=10.0,         # gradient penalty weight
-        perceptual_weight=1.0,  # perceptual loss weight
+        perceptual_weight=1.0,  
         test_mode=True,
     ):
         super().__init__()
@@ -192,19 +186,15 @@ class VQWGAN(nn.Module):
         return self.decoder(self.post_quant_conv(f_hat)).clamp_(-1, 1)
     
     def forward(self, inp, ret_usages=False):
-        """
-        Forward pass for training
-        Returns: reconstruction, usages, vq_loss
-        """
+
         f = self.encode(inp)
         
-        # CRITICAL: Clamp latents to prevent explosion
-        # This prevents the encoder from producing extreme values under adversarial pressure
+        # clamp pour tester  
         f = torch.clamp(f, -10.0, 10.0)
         
         f_hat, usages, vq_loss = self.quantize(f, ret_usages=ret_usages)
         
-        # Additional safety: clamp vq_loss to prevent gradient explosion
+        # clamp au cas où 
         if isinstance(vq_loss, torch.Tensor):
             vq_loss = torch.clamp(vq_loss, 0.0, 100.0)
         
@@ -213,8 +203,7 @@ class VQWGAN(nn.Module):
     
     def compute_gradient_penalty(self, real_samples, fake_samples):
         """
-        Compute gradient penalty for WGAN-GP
-        Enforces Lipschitz constraint on discriminator
+        Gradient penalty for WGAN-GP so that we work on  Lipschitz  function for the  discriminator
         """
         batch_size = real_samples.size(0)
         alpha = torch.rand(batch_size, 1, 1, 1, device=real_samples.device)
@@ -242,8 +231,7 @@ class VQWGAN(nn.Module):
     
     def discriminator_loss(self, real_imgs, fake_imgs):
         """
-        Compute Wasserstein discriminator loss with gradient penalty
-        Discriminator maximizes: E[D(real)] - E[D(fake)] - λ·GP
+        Wasserstein discriminator loss with gradient penalty, according to the notes, the discriminator maximizes: E[D(real)] - E[D(fake)] - λ·GP
         """
         # Real images
         real_validity = self.discriminator(real_imgs)
@@ -274,8 +262,7 @@ class VQWGAN(nn.Module):
     
     def generator_loss(self, fake_imgs):
         """
-        Compute generator (VAE) adversarial loss
-        Generator minimizes: -E[D(fake)]
+        Generator adversarial loss Generator minimizes: -E[D(fake)]
         """
         fake_validity = self.discriminator(fake_imgs)
         g_loss = -fake_validity.mean()
@@ -293,7 +280,7 @@ class VQWGAN(nn.Module):
         # Forward pass
         rec, usages, vq_loss = self.forward(inp, ret_usages=True)
         
-        # Reconstruction loss (L1 + L2 for stability)
+        # Reconstruction loss (L1 + MSE)
         rec_loss = F.l1_loss(rec, inp) + 0.5 * F.mse_loss(rec, inp)
         
         # Adversarial loss (only after disc_start iterations)

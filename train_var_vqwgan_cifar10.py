@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 import os
 import argparse
@@ -16,14 +14,11 @@ from torchvision.utils import save_image
 
 from models.vqwgan import VQWGAN
 from models.var import VAR
-from torch.cuda.amp import autocast, GradScaler
 
 
-# =========================
-# Args
-# =========================
+
 def get_args():
-    parser = argparse.ArgumentParser('VAR training on CIFAR-10 with VQWGAN (+ scheduled sampling & per-scale acc)')
+    parser = argparse.ArgumentParser('VAR training on CIFAR-10 with VQWGAN')
 
     # Paths
     parser.add_argument('--data_path', type=str, default='./data')
@@ -45,15 +40,6 @@ def get_args():
     parser.add_argument('--warmup_epochs', type=int, default=5)
     parser.add_argument('--label_smooth', type=float, default=0.05)
     parser.add_argument('--grad_clip', type=float, default=1.0)
-    parser.add_argument('--amp', action='store_true')
-
-    # Scheduled sampling
-    parser.add_argument('--ss_start_epoch', type=int, default=-1, help='Epoch to start scheduled sampling (-1 to disable)')
-    parser.add_argument('--ss_prob', type=float, default=0.15, help='Scheduled sampling prob when enabled (0..1)')
-
-    # EMA for sampling
-    parser.add_argument('--ema', action='store_true', help='Use EMA weights for sampling')
-    parser.add_argument('--ema_decay', type=float, default=0.999, help='EMA decay')
 
     # Logging / Eval
     parser.add_argument('--print_freq', type=int, default=100)
@@ -70,9 +56,7 @@ def get_args():
     return parser.parse_args()
 
 
-# =========================
-# Loss
-# =========================
+# Loss cross entropy 
 class LabelSmoothingCrossEntropy(nn.Module):
     def __init__(self, smoothing=0.1):
         super().__init__()
@@ -88,7 +72,7 @@ class LabelSmoothingCrossEntropy(nn.Module):
         return loss
 
 
-def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps):
+def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps): # tip to decease LR seen on VAR repo
     def lr_lambda(current_step):
         if current_step < num_warmup_steps:
             return float(current_step) / float(max(1, num_warmup_steps))
@@ -97,9 +81,7 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-# =========================
-# Utils
-# =========================
+#util to convert v_patch_nums to tuple of int
 def _to_tuple_int(v):
     if isinstance(v, str):
         return tuple(int(x.strip()) for x in v.split(',') if x.strip())
@@ -108,40 +90,7 @@ def _to_tuple_int(v):
     return (1, 2, 4, 8)
 
 
-class EMA:
-    def __init__(self, module: nn.Module, decay=0.999):
-        self.decay = decay
-        self.shadow = {}
-        self.backup = {}
-        for name, param in module.named_parameters():
-            if param.requires_grad:
-                self.shadow[name] = param.data.clone()
-
-    def update(self, module: nn.Module):
-        decay = self.decay
-        for name, param in module.named_parameters():
-            if param.requires_grad:
-                assert name in self.shadow
-                new_avg = (1.0 - decay) * param.data + decay * self.shadow[name]
-                self.shadow[name] = new_avg.clone()
-
-    def apply_shadow(self, module: nn.Module):
-        self.backup = {}
-        for name, param in module.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                self.backup[name] = param.data.clone()
-                param.data = self.shadow[name].clone()
-
-    def restore(self, module: nn.Module):
-        for name, param in module.named_parameters():
-            if name in self.backup:
-                param.data = self.backup[name].clone()
-        self.backup = {}
-
-
-# =========================
-# VQWGAN loading
-# =========================
+#load VQWGAN
 def load_vqwgan(args, device):
     print(f"📥 Loading VQWGAN from {args.vqwgan_path}...")
     if not os.path.exists(args.vqwgan_path):
@@ -171,9 +120,9 @@ def load_vqwgan(args, device):
         quant_resi = src.get('quant_resi', quant_resi)
         share_quant_resi = src.get('share_quant_resi', share_quant_resi)
         v_patch_nums = _to_tuple_int(src.get('v_patch_nums', v_patch_nums))
-        print("✅ Using VQWGAN config from checkpoint")
+        print("Using VQWGAN config from checkpoint")
     else:
-        print("⚠️  No config found in VQWGAN checkpoint; using CIFAR-10 defaults")
+        print("No config found in VQWGAN checkpoint; using CIFAR-10 defaults")
 
     print(f"   vocab_size={vocab_size}, z_channels={z_channels}, ch={ch}, beta={beta}, "
           f"quant_resi={quant_resi}, share_quant_resi={share_quant_resi}, v_patch_nums={v_patch_nums}")
@@ -192,28 +141,28 @@ def load_vqwgan(args, device):
     # choose state dict
     if 'generator' in checkpoint:
         state = checkpoint['generator']
-        print("📥 Loading VQ params from checkpoint['generator']")
+        print("Loading VQ params from checkpoint['generator']")
     elif 'vqwgan' in checkpoint:
         state = checkpoint['vqwgan']
-        print("📥 Loading VQ params from checkpoint['vqwgan']")
+        print("Loading VQ params from checkpoint['vqwgan']")
     elif 'model' in checkpoint:
         state = checkpoint['model']
-        print("📥 Loading VQ params from checkpoint['model']")
+        print("Loading VQ params from checkpoint['model']")
     else:
         state = checkpoint
-        print("📥 Loading VQ params from checkpoint root")
+        print("Loading VQ params from checkpoint root")
 
     state = {k: v for k, v in state.items()
              if not (k.startswith('discriminator.') or k.startswith('patch_discriminator.'))}
     incompat = vqwgan.load_state_dict(state, strict=False)
     if getattr(incompat, 'missing_keys', None):
-        print(f"⚠️  Missing VQ keys: {len(incompat.missing_keys)} (showing first 10)")
+        print(f"Missing VQ keys: {len(incompat.missing_keys)} (showing first 10)")
         for k in incompat.missing_keys[:10]:
             print(f"   - {k}")
     if getattr(incompat, 'unexpected_keys', None):
         non_disc = [k for k in incompat.unexpected_keys if 'discriminator' not in k]
         if non_disc:
-            print(f"⚠️  Unexpected non-D VQ keys: {len(non_disc)} (showing first 10)")
+            print(f"Unexpected non-D VQ keys: {len(non_disc)}")
             for k in non_disc[:10]:
                 print(f"   - {k}")
 
@@ -227,8 +176,8 @@ def load_vqwgan(args, device):
 # VAR
 # =========================
 def create_var_model(vqwgan, args, device):
-    print("🏗️  Creating VAR...")
-    patch_nums = getattr(vqwgan.quantize, 'v_patch_nums', (1, 2, 4, 8))
+    print("Creating VAR..")
+    patch_nums = getattr(vqwgan.quantize, 'v_patch_nums', (1, 2, 4, 8)) # 4 scales for cifar10
     var = VAR(
         vae_local=vqwgan,
         num_classes=10,
@@ -246,15 +195,13 @@ def create_var_model(vqwgan, args, device):
         flash_if_available=True,
         fused_if_available=True,
     ).to(device)
-    print("✅ VAR ready")
+    print("VAR ready")
     return var
 
 
-# =========================
-# Data
-# =========================
+#data loader
 def prepare_data(args):
-    print("📊 Preparing CIFAR-10 dataset...")
+    print("Preparing CIFAR-10 dataset...")
     train_transform = transforms.Compose([
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
@@ -269,13 +216,10 @@ def prepare_data(args):
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True, drop_last=True)
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    print("✅ Dataset ready")
+    print("Dataset ready")
     return train_loader, test_loader
 
 
-# =========================
-# Helper: per-scale splitting
-# =========================
 def _concat_targets(gt_ms_idx_Bl):
     return torch.cat(gt_ms_idx_Bl, dim=1)  # [B, L_total]
 
@@ -293,40 +237,8 @@ def _split_by_scales(tensor_BL, lengths):
     return out
 
 
-# =========================
-# Scheduled sampling mix
-# =========================
-def maybe_scheduled_sampling(vqwgan, logits_BLV, gt_ms_idx_Bl, epoch, args):
-    """
-    Retourne (x_BLCv_wo_first_l, target_BL).
-    Si SS actif, mélange une partie des GT tokens avec les prédictions,
-    puis reconstruit les features de teacher-forcing via quantizer.idxBl_to_var_input.
-    """
-    target_BL = _concat_targets(gt_ms_idx_Bl)  # [B, L]
-
-    # disabled
-    if args.ss_start_epoch < 0 or epoch < args.ss_start_epoch or args.ss_prob <= 0.0:
-        x_BLCv_wo_first_l = vqwgan.quantize.idxBl_to_var_input(gt_ms_idx_Bl)
-        return x_BLCv_wo_first_l, target_BL
-
-    with torch.no_grad():
-        pred_BL = logits_BLV.argmax(dim=-1)  # [B, L]
-        mask = (torch.rand_like(target_BL, dtype=torch.float) < args.ss_prob)
-        mixed_BL = torch.where(mask, pred_BL, target_BL)
-
-        # Re-split per scale using lengths from GT
-        lengths = _scale_lengths(gt_ms_idx_Bl)
-        mixed_list = _split_by_scales(mixed_BL, lengths)
-
-        # Recompute teacher-forcing features from the mixed tokens
-        x_BLCv_wo_first_l = vqwgan.quantize.idxBl_to_var_input(mixed_list)
-        return x_BLCv_wo_first_l, target_BL
-
-
-# =========================
-# Train / Eval (with per-scale acc)
-# =========================
-def train_one_epoch(var, vqwgan, train_loader, optimizer, scheduler, criterion, scaler, ema, epoch, args, device):
+# Train / Eval 
+def train_one_epoch(var, vqwgan, train_loader, optimizer, scheduler, criterion, epoch, args, device):
     var.train()
     total_loss = 0.0
     total_acc = 0.0
@@ -348,39 +260,16 @@ def train_one_epoch(var, vqwgan, train_loader, optimizer, scheduler, criterion, 
 
         optimizer.zero_grad(set_to_none=True)
 
-        if device.type == "cuda":
-            ctx = torch.cuda.amp.autocast(enabled=args.amp)
-        else:
-            # Older PyTorch CPU autocast may not exist; fallback no autocast.
-            ctx = torch.no_grad() if not args.amp else torch.no_grad()
+        # Forward pass
+        logits_BLV = var(labels, vqwgan.quantize.idxBl_to_var_input(gt_ms_idx_Bl))  # [B, L, V]
+        loss = criterion(logits_BLV.reshape(-1, logits_BLV.size(-1)), target_BL.reshape(-1))
 
-        with ctx:
-            # First pass to get logits for potential scheduled sampling mix
-            logits_BLV = var(labels, vqwgan.quantize.idxBl_to_var_input(gt_ms_idx_Bl))  # [B, L, V]
-
-            # maybe scheduled sampling: rebuild features if needed
-            x_BLCv_wo_first_l, target_BL = maybe_scheduled_sampling(vqwgan, logits_BLV, gt_ms_idx_Bl, epoch, args)
-
-            # If we changed inputs, recompute logits with mixed features
-            if x_BLCv_wo_first_l is not None and x_BLCv_wo_first_l is not vqwgan.quantize.idxBl_to_var_input(gt_ms_idx_Bl):
-                logits_BLV = var(labels, x_BLCv_wo_first_l)
-
-            loss = criterion(logits_BLV.reshape(-1, logits_BLV.size(-1)), target_BL.reshape(-1))
-
-        if args.amp and device.type == "cuda":
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(var.parameters(), args.grad_clip)
-            scaler.step(optimizer)
-            scaler.update()
-        else:
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(var.parameters(), args.grad_clip)
-            optimizer.step()
+        # Backward
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(var.parameters(), args.grad_clip)
+        optimizer.step()
 
         scheduler.step()
-        if ema is not None:
-            ema.update(var)
 
         with torch.no_grad():
             pred_BL = logits_BLV.argmax(dim=-1)  # [B, L]
@@ -415,9 +304,7 @@ def train_one_epoch(var, vqwgan, train_loader, optimizer, scheduler, criterion, 
 
 
 @torch.no_grad()
-def evaluate(var, vqwgan, test_loader, criterion, ema, args, device):
-    if ema is not None:
-        ema.apply_shadow(var)
+def evaluate(var, vqwgan, test_loader, criterion, args, device):
     var.eval()
 
     total_loss = 0.0
@@ -454,25 +341,18 @@ def evaluate(var, vqwgan, test_loader, criterion, ema, args, device):
         total_loss += loss.item()
         total_acc += acc.item()
 
-    if ema is not None:
-        ema.restore(var)
-
     avg_loss = total_loss / num_batches
     avg_acc = total_acc / num_batches
     avg_scales = [sum_acc_scales[i] / max(1, sum_cnt_scales[i]) for i in range(len(sum_acc_scales))]
     return avg_loss, avg_acc, avg_scales
 
 
-# =========================
-# Sampling helpers
-# =========================
+#sampling funcs
 @torch.no_grad()
-def sample_images(var, vqwgan, epoch, args, device, ema=None):
-    if ema is not None:
-        ema.apply_shadow(var)
+def sample_images(var, vqwgan, epoch, args, device):
     var.eval()
 
-    print(f"🎨 Generating {args.num_samples} samples...")
+    print(f"Generating {args.num_samples} samples...")
     num_per_class = max(1, args.num_samples // 10)
     all_samples = []
     vocab = getattr(vqwgan, 'vocab_size', 1024)
@@ -512,10 +392,8 @@ def sample_images(var, vqwgan, epoch, args, device, ema=None):
     if int(args.num_samples ** 0.5) ** 2 == args.num_samples:
         nrow = int(args.num_samples ** 0.5)
     save_image(all_samples, save_path, nrow=nrow)
-    print(f"✅ Samples saved to {save_path}")
+    print(f"Samples saved to {save_path}")
 
-    if ema is not None:
-        ema.restore(var)
     return all_samples
 
 
@@ -523,7 +401,7 @@ def sample_images(var, vqwgan, epoch, args, device, ema=None):
 def save_reconstructions(vqwgan, test_loader, epoch, args, device):
     ds = test_loader.dataset
     n = len(ds)
-    start = (epoch * 37) % (n - 32) if n > 32 else 0
+    start = (epoch * 37) % (n - 32) if n > 32 else 0 # 37 arbitrary prime but  > 32
     imgs = torch.stack([ds[i][0] for i in range(start, start + 32)]).to(device)
 
     rec = vqwgan.img_to_reconstructed_img(imgs, last_one=True)
@@ -535,12 +413,11 @@ def save_reconstructions(vqwgan, test_loader, epoch, args, device):
     save_path = os.path.join(args.output_dir, 'reconstructions', f'epoch_{epoch:04d}_recon.png')
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     save_image(comp, save_path, nrow=8)
-    print(f"✅ Reconstructions saved to {save_path}")
+    print(f"Reconstructions saved to {save_path}")
 
 
-# =========================
 # Main
-# =========================
+
 def main():
     args = get_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -565,8 +442,6 @@ def main():
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
 
     criterion = LabelSmoothingCrossEntropy(smoothing=args.label_smooth)
-    scaler = GradScaler() if (args.amp and device.type == "cuda") else None
-    ema = EMA(var, decay=args.ema_decay) if args.ema else None
 
     best_acc = 0.0
 
@@ -574,14 +449,14 @@ def main():
         print(f"\n{'=' * 80}\nEpoch {epoch}/{args.epochs}\n{'=' * 80}")
 
         train_loss, train_acc, train_scales = train_one_epoch(
-            var, vqwgan, train_loader, optimizer, scheduler, criterion, scaler, ema, epoch, args, device
+            var, vqwgan, train_loader, optimizer, scheduler, criterion, epoch, args, device
         )
-        print(f"\n📊 Train | Loss:{train_loss:.4f}  Acc:{train_acc:.4f}  "
+        print(f"\nTrain | Loss:{train_loss:.4f}  Acc:{train_acc:.4f}  "
               f"Per-scale:{' '.join([f'{a:.3f}' for a in train_scales])}")
 
         if epoch % args.eval_freq == 0:
-            val_loss, val_acc, val_scales = evaluate(var, vqwgan, test_loader, criterion, ema, args, device)
-            print(f"📈 Val   | Loss:{val_loss:.4f}  Acc:{val_acc:.4f}  "
+            val_loss, val_acc, val_scales = evaluate(var, vqwgan, test_loader, criterion, args, device)
+            print(f"Val   | Loss:{val_loss:.4f}  Acc:{val_acc:.4f}  "
                   f"Per-scale:{' '.join([f'{a:.3f}' for a in val_scales])}")
 
             if val_acc > best_acc:
@@ -595,9 +470,9 @@ def main():
                     'best_acc': best_acc,
                     'args': vars(args),
                 }, save_path)
-                print(f"✅ Best model saved (acc: {best_acc:.4f})")
+                print(f"Best model saved (acc: {best_acc:.4f})")
 
-            sample_images(var, vqwgan, epoch, args, device, ema=ema)
+            sample_images(var, vqwgan, epoch, args, device)
             save_reconstructions(vqwgan, test_loader, epoch, args, device)
 
         if epoch % args.save_freq == 0:
@@ -611,7 +486,7 @@ def main():
                 'train_acc': train_acc,
                 'args': vars(args),
             }, save_path)
-            print(f"💾 Checkpoint saved: {save_path}")
+            print(f"Checkpoint saved: {save_path}")
 
     print("\n" + "=" * 80)
     print("Training completed!")

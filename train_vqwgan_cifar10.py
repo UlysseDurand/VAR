@@ -34,10 +34,10 @@ def get_args_parser():
     parser.add_argument('--disc_ch', default=64, type=int)
     parser.add_argument('--disc_num_layers', default=2, type=int, help='Fewer layers for small images')
     parser.add_argument('--disc_start', default=0, type=int, help='Start gen later')
-    parser.add_argument('--disc_weight', default=0.5, type=float, help='Lower adversarial weight initially')
+    parser.add_argument('--disc_weight', default=0.5, type=float, help='Lower adversarial weight')
     parser.add_argument('--gp_weight', default=20.0, type=float)
     parser.add_argument('--n_critic', default=5, type=int, help='Update gen less frequently')
-    parser.add_argument('--use_patch_disc', action='store_true')
+    parser.add_argument('--use_patch_disc', action='store_true') # does not work well for 32x32
     parser.add_argument('--perceptual_weight', default=1.0, type=float, help='Perceptual loss weight')
     
     # Training parameters
@@ -90,7 +90,7 @@ class VQWGANTrainer:
         self.last_d_stats = {}
         self.last_g_loss = 0.0
         self.last_g_stats = {}
-    
+    # learning rate starts with a warmup in order to stabilize training (tips seen in vq gan implementations)
     def get_lr(self):
         """Learning rate with warmup"""
         if self.global_step < self.warmup_steps:
@@ -115,8 +115,8 @@ class VQWGANTrainer:
         # Update learning rate (warmup)
         self.update_lr()
         
-        # ========== Update Discriminator (Critic) ==========
-        # Le discriminateur s'entraîne à chaque pas (sauf si le générateur n'a pas encore démarré)
+        # discriminator update
+        # each step we update D
         if self.global_step >= self.args.disc_start:
             self.optimizer_d.zero_grad()
             
@@ -134,13 +134,16 @@ class VQWGANTrainer:
             self.last_d_loss = d_loss.item()
             self.last_d_stats = d_stats
         else:
-            # Avant disc_start, pas d'entraînement du discriminateur
+            # before disc_start we just update rec loss
             d_loss = 0.0
             d_stats = {}
         
-        # ========== Update Generator ==========
-        # Le générateur s'entraîne uniquement tous les n_critic pas
-        if self.global_step >= self.args.disc_start and self.global_step % self.args.n_critic == 0:
+        # Update Generator 
+
+        should_update_gen = (self.global_step < self.args.disc_start) or \
+                           (self.global_step >= self.args.disc_start and self.global_step % self.args.n_critic == 0)
+        
+        if should_update_gen:
             self.optimizer_g.zero_grad()
             
             # Compute generator loss
@@ -148,18 +151,16 @@ class VQWGANTrainer:
 
             g_total_loss.backward()
 
-            # Gradient clipping (less aggressive)
+            # Gradient clipping 
             torch.nn.utils.clip_grad_norm_(self.model.encoder.parameters(), max_norm=5.0)
             torch.nn.utils.clip_grad_norm_(self.model.decoder.parameters(), max_norm=5.0)
             torch.nn.utils.clip_grad_norm_(self.model.quantize.parameters(), max_norm=5.0)
             
             self.optimizer_g.step()
             
-            # Store for logging
             self.last_g_loss = g_total_loss.item()
             self.last_g_stats = g_stats
         else:
-            # Utiliser les dernières valeurs enregistrées pour le logging
             if hasattr(self, 'last_g_loss'):
                 g_total_loss = torch.tensor(self.last_g_loss)
                 g_stats = self.last_g_stats
@@ -212,9 +213,9 @@ def main(args):
     # Select GPU
     if torch.cuda.is_available():
         torch.cuda.set_device(args.gpu)
-        print(f"✓ Using GPU {args.gpu}: {torch.cuda.get_device_name(args.gpu)}")
+        print(f"Using GPU {args.gpu}: {torch.cuda.get_device_name(args.gpu)}")
     
-    # Setup distributed mode (required even for single GPU)
+    # Setup distributed mode (required even for single GPU) (bug fix with cuda i don't really understand that but it works)
     if not torch.distributed.is_initialized():
         os.environ['MASTER_ADDR'] = 'localhost'
         os.environ['MASTER_PORT'] = '12355'
@@ -226,16 +227,16 @@ def main(args):
             world_size=1,
             rank=0
         )
-        print("✓ Initialized single-process distributed mode")
+        print("Initialized single-process distributed mode")
     
     device = torch.device(f'cuda:{args.gpu}' if torch.cuda.is_available() else 'cpu')
     
     # Set seed
     torch.manual_seed(args.seed)
     
-    # CIFAR-10 specific: smaller patch numbers for 32x32 images
-    # For 32x32 with 4x downsampling → 8x8 final size
+    # CIFAR-10  smaller patch numbers for 32x32 images
     v_patch_nums = (1, 2, 4, 8)  # Multi-scale for 32x32
+        args.v_patch_nums = v_patch_nums
     
     # Build model
     print(f'Building VQWGAN model for CIFAR-10 (32x32)...')
@@ -342,7 +343,7 @@ def main(args):
     
     # Training loop
     print(f'Starting training for {args.epochs} epochs...')
-    print(f'Dataset: CIFAR-10 (50k train, 10k test)')
+    print(f'Dataset: CIFAR-10 ')
     print(f'Image size: 32x32')
     print(f'Batch size: {args.batch_size}')
     print(f'Vocab size: {args.vocab_size}')
@@ -350,17 +351,22 @@ def main(args):
     
     for epoch in range(args.epochs):
         model.train()
-        metric_lg = MetricLogger(delimiter='  ')  # Create new logger per epoch
+        metric_lg = MetricLogger(delimiter='  ')  
         
         for it, (imgs, _) in enumerate(train_loader):
             g_loss, d_loss = trainer.train_step(imgs, metric_lg)
             
             # Logging
             if trainer.global_step % args.log_freq == 0:
-                # Indicate if generator was actually updated this step
-                gen_marker = "🔄 G" if trainer.global_step % args.n_critic == 0 else "   D"
+                # Indicate training mode
+                if trainer.global_step < args.disc_start:
+                    marker = "G-warmup"
+                elif trainer.global_step % args.n_critic == 0:
+                    marker = "G+D"
+                else:
+                    marker = "   D-only"
                 print(f'Epoch [{epoch}/{args.epochs}] '
-                      f'Step [{trainer.global_step}] {gen_marker} '
+                      f'Step [{trainer.global_step}] {marker} '
                       f'G_loss: {g_loss:.4f} D_loss: {d_loss:.4f}')
             
             # Save checkpoint
@@ -374,12 +380,12 @@ def main(args):
                     'global_step': trainer.global_step,
                     'args': args,
                 }, save_path)
-                print(f'✓ Saved checkpoint to {save_path}')
+                print(f'Saved checkpoint to {save_path}')
                 
                 # Visualize
                 vis_path = os.path.join(args.output_dir, f'recon_step{trainer.global_step}.png')
                 trainer.visualize(test_loader, vis_path)
-                print(f'✓ Saved visualization to {vis_path}')
+                print(f'Saved visualization to {vis_path}')
         
         # End of epoch
         save_path = os.path.join(args.output_dir, f'vqwgan_epoch{epoch}.pth')
@@ -391,7 +397,7 @@ def main(args):
             'global_step': trainer.global_step,
             'args': args,
         }, save_path)
-        print(f'✓ Saved epoch checkpoint to {save_path}')
+        print(f'Saved epoch checkpoint to {save_path}')
     
     print('Training completed!')
 

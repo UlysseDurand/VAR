@@ -1,23 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
-"""
-Génération d'images CIFAR-10 par classe avec VAR + VQWGAN (déjà entraînés).
-- Recharge la config VQWGAN depuis le checkpoint (beta, quant_resi, share_quant_resi, v_patch_nums).
-- Construit le VAR, charge le checkpoint.
-- Génère N images pour une classe demandée (0..9 ou nom de classe).
-- Sauvegarde une grille + images individuelles.
-
-Exemples :
-  python gen_var_class.py \
-    --vqwgan_ckpt ./output/vqwgan_ultra_stable/vqwgan_epoch29.pth \
-    --var_ckpt ./output/var_vqwgan_cifar10/checkpoint_best.pth \
-    --class car --num 64 --cfg 1.5 --top_k 512 --top_p 0.9 --seed 123 \
-    --outdir ./output/var_samples
-
-  python gen_var_class.py \
-    --vqwgan_ckpt ... --var_ckpt ... --class 7 --num 40
-"""
 
 import os
 import argparse
@@ -88,7 +69,7 @@ def load_vqwgan(vqwgan_ckpt, device):
         test_mode=True,
     ).to(device).eval()
 
-    # Choisir la bonne clé de poids
+    # find state dict
     if 'generator' in ckpt:
         state = ckpt['generator']
     elif 'vqwgan' in ckpt:
@@ -98,7 +79,7 @@ def load_vqwgan(vqwgan_ckpt, device):
     else:
         state = ckpt
 
-    # Filtrer D
+    # Filter out discriminator weights
     state = {k:v for k,v in state.items()
              if not (k.startswith('discriminator.') or k.startswith('patch_discriminator.'))}
 
@@ -142,14 +123,13 @@ def parse_args():
     ap.add_argument("--var_ckpt", type=str, required=True, help="Path to VAR checkpoint (.pth)")
     ap.add_argument("--class", dest="class_name_or_id", type=str, required=True,
                     help="Classe CIFAR-10 (nom ou id 0..9). Ex: 'car' ou '1'")
-    ap.add_argument("--num", type=int, default=64, help="Nombre d'images à générer (multiple de 10 recommandé)")
+    ap.add_argument("--num", type=int, default=64, help="Nombre d'images à générer")
     ap.add_argument("--cfg", type=float, default=1.5, help="Classifier-free guidance scale")
     ap.add_argument("--top_k", type=int, default=512, help="Top-k sampling")
     ap.add_argument("--top_p", type=float, default=0.9, help="Top-p (nucleus) sampling")
     ap.add_argument("--temperature", type=float, default=1.0, help="Température (si supportée par ton VAR)")
     ap.add_argument("--seed", type=int, default=0, help="Graine aléatoire")
     ap.add_argument("--outdir", type=str, default="./output/var_samples", help="Dossier de sortie")
-    # paramètres “structure” du VAR (doivent correspondre à l’entraînement)
     ap.add_argument("--depth", type=int, default=16)
     ap.add_argument("--embed_dim", type=int, default=512)
     ap.add_argument("--num_heads", type=int, default=8)
@@ -158,7 +138,6 @@ def parse_args():
     return ap.parse_args()
 
 def resolve_class_id(s):
-    # Accepte int sous forme de string, ou nom
     if s.isdigit():
         cid = int(s)
         if not (0 <= cid <= 9):
@@ -166,7 +145,7 @@ def resolve_class_id(s):
         return cid
     s = s.lower().strip()
     if s not in NAME_TO_ID:
-        raise ValueError(f"Classe inconnue '{s}'. Utilise un id (0..9) ou un nom parmi: {CIFAR10_CLASSES}")
+        raise ValueError(f"unknwon class '{s}'. correct ones are : {CIFAR10_CLASSES}")
     return NAME_TO_ID[s]
 
 @torch.no_grad()
@@ -179,7 +158,7 @@ def main():
     if device.type == "cuda":
         torch.cuda.manual_seed_all(args.seed)
 
-    # charge VQWGAN + VAR
+    # load VQWGAN
     vq = load_vqwgan(args.vqwgan_ckpt, device)
     vocab = getattr(vq, 'vocab_size', 1024)
     top_k = max(1, min(args.top_k, vocab - 1))
@@ -193,14 +172,13 @@ def main():
 
     # classe
     class_id = resolve_class_id(args.class_name_or_id)
-    print(f"→ Génération pour la classe {class_id} ({CIFAR10_CLASSES[class_id]})")
+    print(f" gen for the class:  {class_id} ({CIFAR10_CLASSES[class_id]})")
 
-    # batchs de génération
+   
     B = args.num
     labels = torch.full((B,), class_id, dtype=torch.long, device=device)
 
-    # la méthode que tu utilises déjà dans ton code
-    # si ton VAR supporte 'temperature', ajoute-le ; sinon enlève-le.
+    # generation  using the VAR method (not implemented by us)
     try:
         samples = var.autoregressive_infer_cfg(
             B=B,
@@ -210,10 +188,9 @@ def main():
             top_p=args.top_p,
             g_seed=args.seed,
             more_smooth=False,
-            temperature=args.temperature,  # retire si non supporté
-        )  # [B,3,H,W] in [0,1]
+            temperature=args.temperature,  
+        )  
     except TypeError:
-        # fallback si temperature n'est pas supporté par ta version
         samples = var.autoregressive_infer_cfg(
             B=B,
             label_B=labels,
@@ -224,24 +201,22 @@ def main():
             more_smooth=False,
         )
 
-    # clamp sécurité
     samples = samples.clamp(0, 1)
 
-    # sauvegardes
+    # save images
     grid_path = os.path.join(args.outdir, f"samples_{CIFAR10_CLASSES[class_id]}_N{B}_seed{args.seed}.png")
-    # nrow “carré” si possible
     nrow = 10
     if int(B**0.5)**2 == B:
         nrow = int(B**0.5)
     save_image(samples, grid_path, nrow=nrow)
-    print(f"✅ Grille sauvegardée : {grid_path}")
+    print(f"Grid saved: {grid_path}")
 
-    # fichiers individuels
+    # individual files
     indiv_dir = os.path.join(args.outdir, f"{CIFAR10_CLASSES[class_id]}_seed{args.seed}")
     os.makedirs(indiv_dir, exist_ok=True)
     for i, img in enumerate(samples):
         save_image(img, os.path.join(indiv_dir, f"{i:04d}.png"))
-    print(f"✅ {B} images individuelles sauvegardées dans : {indiv_dir}")
+    print(f"{B} individual images saved in: {indiv_dir}")
 
 if __name__ == "__main__":
     main()
